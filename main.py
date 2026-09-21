@@ -9,6 +9,7 @@ from datadog import DogStatsd
 
 MODE = os.getenv('FAULT_MODE', 'healthy')
 CATALOG_DELAY_MS = min(2000, max(0, int(os.getenv('CATALOG_DELAY_MS', '0'))))
+CATALOG_LOCK = os.getenv('CATALOG_LOCK', 'false').lower() == 'true'
 VERSION = os.getenv('DD_VERSION', '1.0.0')
 metrics = DogStatsd(host='127.0.0.1', port=8125, namespace='pig')
 log_queue = asyncio.Queue(maxsize=200)
@@ -49,9 +50,17 @@ async def lifespan(app):
     db=sqlite3.connect('/tmp/catalog.sqlite');db.execute('CREATE TABLE IF NOT EXISTS products (sku TEXT PRIMARY KEY, price INTEGER)');db.execute("INSERT OR REPLACE INTO products VALUES ('demo-book',2500)");db.commit();db.close()
     emit({'event':'service_started','dependency':'catalog.sqlite','config_version':VERSION})
     tasks=[asyncio.create_task(traffic())]
+    # Disposable incident fixture: exclusive lock, automatically released after 15 minutes.
+    lock=None
+    if CATALOG_LOCK:
+        lock=sqlite3.connect('/tmp/catalog.sqlite');lock.execute('BEGIN EXCLUSIVE')
+        async def release_lock():
+            await asyncio.sleep(900);lock.rollback()
+        tasks.append(asyncio.create_task(release_lock()))
     if os.getenv('DD_API_KEY'): tasks.append(asyncio.create_task(ship_logs()))
     yield
     for t in tasks:t.cancel()
+    if lock is not None:lock.close()
 
 app=FastAPI(lifespan=lifespan)
 @app.get('/health')
@@ -67,7 +76,7 @@ async def checkout(body:dict):
                 if CATALOG_DELAY_MS: await asyncio.sleep(CATALOG_DELAY_MS / 1000)
                 # The controlled incident points at an empty catalog after a bad deployment.
                 path='/tmp/catalog-v2.sqlite' if MODE=='bad_catalog' else '/tmp/catalog.sqlite'
-                db=sqlite3.connect(path)
+                db=sqlite3.connect(path, timeout=0.2)
                 try:row=db.execute('SELECT price FROM products WHERE sku=?',(body.get('sku','demo-book'),)).fetchone()
                 finally:db.close()
                 if not row:raise ValueError('Product missing')
