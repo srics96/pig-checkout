@@ -8,6 +8,7 @@ from ddtrace import tracer
 from datadog import DogStatsd
 
 MODE = os.getenv('FAULT_MODE', 'healthy')
+CATALOG_DELAY_MS = min(2000, max(0, int(os.getenv('CATALOG_DELAY_MS', '0'))))
 VERSION = os.getenv('DD_VERSION', '1.0.0')
 metrics = DogStatsd(host='127.0.0.1', port=8125, namespace='pig')
 log_queue = asyncio.Queue(maxsize=200)
@@ -62,6 +63,8 @@ async def checkout(body:dict):
     with tracer.trace('checkout.process',service='pig-checkout',resource='POST /checkout') as span:
         try:
             with tracer.trace('catalog.lookup',service='pig-checkout'):
+                # Bounded dependency-latency fixture; disabled by default.
+                if CATALOG_DELAY_MS: await asyncio.sleep(CATALOG_DELAY_MS / 1000)
                 # The controlled incident points at an empty catalog after a bad deployment.
                 path='/tmp/catalog-v2.sqlite' if MODE=='bad_catalog' else '/tmp/catalog.sqlite'
                 db=sqlite3.connect(path)
